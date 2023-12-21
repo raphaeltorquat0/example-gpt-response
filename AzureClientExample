@@ -1,0 +1,319 @@
+import Vapor
+import AsyncHTTPClient
+import Foundation
+
+struct AzureAICSearch {
+
+    public func createRequest(messages: [ChatMessage]) throws -> HTTPClient.Request {
+        let url = URL(string: "\(AzureGPTConstants.kOpenAILanguageApis)/openai/deployments/\(AzureGPTConstants.kOpenAIDeploymentApis)/extensions/chat/completions?api-version=2023-08-01-preview")!
+
+        let bodyData: [String: Any] = [
+            "dataSources": [
+                    [
+                    "type": "AzureCognitiveSearch",
+                        "parameters": [
+                            "endpoint": AzureCognitiveSearch.kSearchEndPoint,
+                            "key": AzureCognitiveSearch.kSearchKey,
+                            "indexName": AzureCognitiveSearch.kSearchIndexName
+                        ]
+                    ]
+                ],
+            "messages": messages.map { $0.dictionaryRepresentation }
+        ]
+
+        let body = try JSONSerialization.data(withJSONObject: bodyData)
+        let headers = HTTPHeaders([
+            ("Content-Type", "application/json"),
+            ("api-key", AzureGPTConstants.kKeyOne)
+        ])
+
+        guard let request = try? HTTPClient.Request(url: url, method: .POST, headers: headers, body: .data(body)) else {
+            throw Abort(.internalServerError, reason: "Failed to create request")
+        }
+
+        return request
+    }
+
+  public func sendRequestAndProcessResponse(messages: [ChatMessage]) throws {
+    var nMessage = messages
+    let request = try createRequest(messages: messages)
+    let client = HTTPClient(eventLoopGroupProvider: .createNew)
+    client.execute(request: request).whenComplete { result in
+        switch result {
+        case .failure(let error):
+            print("Failed to send request: \(error)")
+        case .success(let response):
+
+            guard let contentLength = response.headers.first(name: "Content-Length"),
+                  let expectedLength = Int(contentLength),
+                  let actualLength = response.body?.readableBytes,
+                  actualLength == expectedLength else {
+                print("Incomplete response received")
+                return
+            }
+
+            guard let responseData = response.body?.getData(at: 0, length: response.body!.readableBytes) else {
+                print("Failed to get response data")
+                return
+            }
+
+            do {
+
+                try self.processResponse(response: responseData)
+
+            } catch {
+                print("Failed to process response: \(error)")
+            }
+        }
+    }
+}
+
+public func postOpenAILanguageChatCompletionsApis(messages: [ChatMessage]) async throws -> (String, [Choice]) {
+    let httpClient = HTTPClient(eventLoopGroupProvider: .createNew)
+    defer {
+        try? httpClient.syncShutdown()
+    }
+
+    do {
+        let request = try createRequest(messages: messages)
+        let httpResponse = try await httpClient.execute(request: request).get()
+
+        guard let buffer = httpResponse.body else {
+            throw Abort(.internalServerError, reason: "No response body found")
+        }
+
+        let responseData = Data(buffer.readableBytesView)
+
+        let (assistantMessageString, choices) = try processResponse(response: responseData)
+        let cleanedAssistantMessageString = try cleanAssistantMessageString(assistantMessageString: assistantMessageString)
+
+        if let correctedJsonObject = try? JSONSerialization.jsonObject(with: Data(cleanedAssistantMessageString.utf8), options: []) as? [String: Any],
+           let correctedJsonData = try? JSONSerialization.data(withJSONObject: correctedJsonObject, options: []) {
+            if let correctedJsonString = String(data: correctedJsonData, encoding: .utf8) {
+                print("correctedJsonString: \(correctedJsonString)")
+                return (correctedJsonString, choices)
+            }
+        }
+
+        guard let nHttpResponse = httpResponse.body?.getData(at: 0, length: httpResponse.body!.readableBytes) else {
+            throw Abort(.internalServerError, reason: "Failed to get response data")
+        }
+        guard var nResponse = String(data: nHttpResponse, encoding: .utf8)  else {
+            throw Abort(.internalServerError, reason: "Failed to get response data")
+        }
+
+            if let data = nResponse.data(using: .utf8) {
+        do {
+            if let jsonObject = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
+                if let citationsString = jsonObject["citations"] as? String {
+                    let citations = handleCitations(citationsString: citationsString)
+                    print(citations)
+                    nResponse = citations
+                }
+            }
+        } catch {
+            print("Erro ao deserializar JSON: \(error)")
+        }
+    }
+
+        return (nResponse, choices)
+    } catch {
+        print(error)
+        throw Abort(.internalServerError, reason: "Failed to connect to OpenAI: \(error)")
+    }
+}
+
+private func cleanAssistantMessageString(assistantMessageString: [[String: Any]]) throws -> String {
+    let jsonData = try JSONSerialization.data(withJSONObject: assistantMessageString, options: [])
+    let jsonStr = String(data: jsonData, encoding: .utf8)
+    guard let cleanedAssistantMessageString = try jsonStr?.cleanJsonString() else {
+        throw Abort(.internalServerError, reason: "Failed to clean assistant message string")
+    }
+
+    return cleanedAssistantMessageString
+}
+
+  func handleCitations(citationsString: String) -> String {
+    var result = ""
+    if let data = citationsString.data(using: .utf8) {
+        do {
+            if let jsonArray = try JSONSerialization.jsonObject(with: data, options: []) as? [[String: Any]] {
+                // Agora jsonArray é um array de dicionários
+                // Você pode acessar os valores assim:
+                for citation in jsonArray {
+                    if let content = citation["content"] as? String {
+                        print("content: \(content)")
+
+                        result += content + "\n"
+                    }
+                }
+            }
+        } catch {
+            print("Erro ao deserializar JSON: \(error)")
+        }
+    }
+    return result
+}
+
+public func correctJsonObject(cleanedAssistantMessageString: String) throws -> [[String: Any]] {
+    if  let jsonObject = try JSONSerialization.jsonObject(with: cleanedAssistantMessageString.data(using: .utf8)!, options: []) as? [[String: Any]],
+        let jsonData = try? JSONSerialization.data(withJSONObject: jsonObject, options: []),
+        let correctedData = correctData(data: jsonData),
+        let correctedJsonObject = try? JSONSerialization.jsonObject(with: correctedData, options: []) as? [[String: Any]] {
+
+        var processedObjects = [[String: Any]]()
+        for var object in correctedJsonObject {
+            var processedObject = processCitations(from: &object)
+            processedObject = processRoleAndContent(processedObject)
+            processedObjects.append(processedObject)
+        }
+        return processedObjects
+    }
+    throw Abort(.internalServerError, reason: "Failed to correct JSON object")
+}
+
+public func processResponse(response: Data) throws -> ([[String: Any]], [Choice]) {
+    let openAIResponse = try JSONDecoder().decode(APIResponse.self, from: response)
+    var messages = [[String: Any]]()
+
+    openAIResponse.choices.forEach { choice in
+        choice.message?.context.messages.forEach { message  in
+            if let contentString = message.content,
+               let contentData = contentString.data(using: .utf8),
+               var contentDict = try? JSONSerialization.jsonObject(with: contentData, options: []) as? [String: Any] {
+                contentDict = processCitations(from: &contentDict)
+                messages.append(["assistance": processTexts(from: [contentDict])])
+
+            } else {
+                print("Invalid content format in assistant message")
+            }
+        }
+    }
+
+    return (messages, openAIResponse.choices)
+}
+
+private func processCitations(from contentDict: inout [String: Any]) -> [String: Any] {
+    let citations = contentDict["citations"] as? [Citation] ?? []
+    var citationDicts = [[String: Any]]()
+    var imageUrls = [String]()
+    for citation in citations {
+        let citationDict = citation.toDictionary()
+        citationDicts.append(citationDict)
+        if let imageUrl = citationDict["imageUrl"] as? String {
+            imageUrls.append(imageUrl)
+        }
+    }
+    contentDict["citations"] = citationDicts
+    contentDict["imageUrls"] = imageUrls
+
+    return contentDict
+}
+
+private func processTexts(from citations: [[String: Any]]) -> [String] {
+    return citations.compactMap { citation in
+        if let text = citation["text"] as? String {
+            return text.removingBackslashes().removeBackslashesBeforeBraces()
+        }
+        return nil
+    }
+}
+
+private func extractCitations(from message: Message) -> [[String: Any]] {
+    var citations: [[String: Any]] = []
+    if var contentDict = message.content as? [String: Any] {
+        citations = contentDict["citations"] as? [[String: Any]] ?? []
+        for i in 0..<citations.count {
+            let content = citations[i]["content"] as? String ?? ""
+            let title = citations[i]["title"] as? String ?? ""
+            let citation = Citation(url: "", metadata: nil, filepath: nil, id: nil, title: title, categoryId: nil, content: content, text: nil, imageUrl: nil, progress: nil)
+            citations[i] = citation.toDictionary()
+        }
+    }
+    return citations
+}
+
+func processRoleAndContent(_ jsonObject: [String: Any]) -> [String: Any] {
+    var correctedJsonObject = jsonObject
+    let role = correctedJsonObject["role"] as? String ?? ""
+    let content = correctedJsonObject["content"] as? [String: Any] ?? [:]
+    correctedJsonObject["role"] = role
+    correctedJsonObject["content"] = content
+    print("correctedJsonObject: \(correctedJsonObject)")
+
+    return correctedJsonObject
+}
+
+func processJsonStringField(_ jsonObject: [String: Any], fieldName: String) -> [String: Any] {
+    var correctedJsonObject = jsonObject
+    if let fieldString = correctedJsonObject[fieldName] as? String {
+        var fieldStringCleaned = fieldString.replacingOccurrences(of: "\\n", with: "")
+                                             .replacingOccurrences(of: "\\t", with: "")
+                                             .replacingOccurrences(of: "\\r", with: "")
+                                             .replacingOccurrences(of: "\\\"", with: "\"")
+                                             .replacingOccurrences(of: "\\\\", with: "\\")
+        if let fieldData = fieldStringCleaned.data(using: .utf8) {
+            do {
+                if var fieldJson = try JSONSerialization.jsonObject(with: fieldData, options: []) as? [String: Any] {
+                    fieldJson = processJsonStringField(fieldJson, fieldName: "citations")
+                    correctedJsonObject[fieldName] = fieldJson
+                }
+            } catch {
+                print("Failed to decode JSON for field \(fieldName): \(error)")
+                correctedJsonObject[fieldName] = fieldStringCleaned
+            }
+        }
+    }
+    return correctedJsonObject
+}
+
+    func decodeAndVerifyCitation(from assistantMessage: String) throws -> Citation {
+        guard let assistantMessageData = assistantMessage.data(using: .utf8) else {
+            throw Abort(.internalServerError, reason: "Failed to convert assistant message String to Data")
+        }
+
+        let assistantMessageObject = try JSONDecoder().decode(AssistantMessage.self, from: assistantMessageData)
+        let citations = assistantMessageObject.citations
+
+        guard let citation = citations.first else {
+            throw Abort(.internalServerError, reason: "Failed to get citation")
+        }
+
+        guard verifyCitationValues(citation) else {
+            throw Abort(.internalServerError, reason: "Citation values are not valid")
+        }
+
+        return citation
+    }
+
+    func verifyCitationValues(_ citation: Citation) -> Bool {
+        return citation.url != nil && citation.filepath != nil && citation.title != nil && citation.content != nil && citation.imageUrl != nil && citation.progress != nil
+    }
+
+   }
+
+       func correctData(data: Data) -> Data? {
+    do {
+        var jsonUpdated = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any]
+        jsonUpdated =  jsonUpdated?.corrigirQuebrasDeLinha()
+        jsonUpdated =  jsonUpdated?.adicionarAspasEmNumeros()
+        jsonUpdated =  jsonUpdated?.removerBarrasInvertidas()
+        jsonUpdated =  jsonUpdated?.removerValoresNulos()
+
+        // Certifique-se de que jsonUpdated não é nulo antes de iterar sobre ele
+        if var jsonUpdated = jsonUpdated {
+        // Codificar corretamente os caracteres especiais
+                for (key, value) in jsonUpdated {
+            if let stringValue = value as? String {
+                jsonUpdated[key] = stringValue.addingPercentEncoding(withAllowedCharacters: .urlHostAllowed)
+                }
+            }
+        }
+
+        let dataUpdated = try JSONSerialization.data(withJSONObject: jsonUpdated as Any, options: [])
+        return dataUpdated
+    } catch {
+        print(error.localizedDescription)
+        return nil
+    }
+}
